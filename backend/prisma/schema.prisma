@@ -1,0 +1,242 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// PaintOnline — esquema de datos
+//
+// Nota de diseño importante: NO existe object storage. Todo el contenido
+// gráfico se persiste como trazos VECTORIALES (Stroke) y se reconstruye en el
+// navegador de cada cliente. La exportación a PNG ocurre 100% client-side.
+// ─────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  CREATOR
+  VIEWER
+  ADMIN
+}
+
+enum SessionMode {
+  /// Cada participante tiene su propio canvas lógico (filtrado por userId).
+  INDIVIDUAL
+  /// Un único canvas compartido; cada participante recibe una capa exclusiva.
+  LAYERED
+  /// Un único canvas con capas visibles para todos, cualquiera dibuja donde quiere.
+  FREE
+}
+
+enum SessionStatus {
+  DRAFT
+  OPEN
+  LIVE
+  CLOSED
+  ARCHIVED
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  avatarUrl    String?
+  role         Role     @default(VIEWER)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  spacesOwned   Space[]              @relation("SpaceOwner")
+  memberships   SpaceMember[]
+  participations SessionParticipant[]
+  strokes        Stroke[]
+  wins           SessionWinner[]
+  score          UserScore?
+  exportLogs     ExportLog[]
+  refreshToken   RefreshToken?
+
+  @@index([createdAt])
+}
+
+model Space {
+  id          String   @id @default(cuid())
+  name        String
+  slug        String   @unique
+  description String?
+  ownerId     String
+  owner       User     @relation("SpaceOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  isPublic    Boolean  @default(true)
+  /// Puntos otorgados por puesto: { "1": 10, "2": 6, "3": 3 }
+  scoringConfig Json   @default("{\"1\":10,\"2\":6,\"3\":3}")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  members  SpaceMember[]
+  sessions DrawingSession[]
+
+  @@index([ownerId])
+}
+
+model SpaceMember {
+  id       String   @id @default(cuid())
+  spaceId  String
+  userId   String
+  role     Role     @default(VIEWER)
+  joinedAt DateTime @default(now())
+
+  space Space @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([spaceId, userId])
+  @@index([userId])
+}
+
+model DrawingSession {
+  id              String        @id @default(cuid())
+  spaceId         String
+  title           String
+  theme           String?
+  mode            SessionMode
+  status          SessionStatus @default(DRAFT)
+  maxParticipants Int?
+  startTime       DateTime?
+  endTime         DateTime?
+  canvasWidth     Int           @default(1920)
+  canvasHeight    Int           @default(1080)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  space        Space               @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  participants SessionParticipant[]
+  layers       Layer[]
+  strokes      Stroke[]
+  winners      SessionWinner[]
+  exportLogs   ExportLog[]
+
+  @@index([spaceId, status])
+  @@index([status, createdAt])
+}
+
+model SessionParticipant {
+  id        String   @id @default(cuid())
+  sessionId String
+  userId    String
+  joinedAt  DateTime @default(now())
+  /// Capa asignada automáticamente en modo LAYERED.
+  layerId   String?
+  isActive  Boolean  @default(true)
+  leftAt    DateTime?
+
+  session DrawingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  user    User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  layer   Layer?         @relation(fields: [layerId], references: [id], onDelete: SetNull)
+
+  @@unique([sessionId, userId])
+  @@index([userId])
+}
+
+/// En modo INDIVIDUAL cada layer_id es NULL y el aislamiento se hace por
+/// `Stroke.userId`. En LAYERED cada layer tiene un ownerUserId fijo.
+/// En FREE los layers tienen ownerUserId = NULL.
+model Layer {
+  id          String   @id @default(cuid())
+  sessionId   String
+  name        String
+  order       Int      @default(0)
+  /// NULL = capa libre (modo FREE). seteado = capa asignada (modo LAYERED).
+  ownerUserId String?
+  visible     Boolean  @default(true)
+  opacity     Float    @default(1.0)
+  createdAt   DateTime @default(now())
+
+  session      DrawingSession       @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  strokes      Stroke[]
+  participants SessionParticipant[]
+
+  @@index([sessionId, order])
+}
+
+/// Trazo vectorial. Nunca se almacena una imagen: `points` es un JSON con la
+/// lista de puntos {x, y, pressure, t}, lo que permite replay, undo/redo,
+/// sincronización de deltas y re-render en cualquier cliente.
+model Stroke {
+  id          String   @id @default(cuid())
+  sessionId   String
+  layerId     String?
+  userId      String
+  points      Json
+  color       String
+  brushSize   Float
+  tool        String   @default("pen")
+  isErased    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  session DrawingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  layer   Layer?         @relation(fields: [layerId], references: [id], onDelete: SetNull)
+  user    User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, layerId])
+  @@index([sessionId, userId])
+  @@index([sessionId, createdAt])
+}
+
+/// Registro analítico de una descarga. NO guarda binario ni URL: la imagen se
+/// genera y se guarda en el disco del usuario, en su navegador.
+model ExportLog {
+  id        String   @id @default(cuid())
+  sessionId String
+  userId    String
+  scope     String
+  createdAt DateTime @default(now())
+
+  session DrawingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  user    User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, createdAt])
+}
+
+model SessionWinner {
+  id        String   @id @default(cuid())
+  sessionId String
+  userId    String
+  /// 1, 2 o 3
+  position  Int
+  points    Int
+  createdAt DateTime @default(now())
+
+  session DrawingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  user    User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([sessionId, position])
+  @@unique([sessionId, userId])
+  @@index([userId])
+}
+
+model UserScore {
+  id          String @id @default(cuid())
+  userId      String @unique
+  totalPoints Int    @default(0)
+  goldCount   Int    @default(0)
+  silverCount Int    @default(0)
+  bronzeCount Int    @default(0)
+  updatedAt   DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([totalPoints(sort: Desc)])
+}
+
+/// Un único refresh token vigente por usuario (se rota en cada refresh).
+/// Permite revocar el acceso al hacer logout sin esperar a que expire el JWT.
+model RefreshToken {
+  userId    String   @id
+  jti       String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+}
